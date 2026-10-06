@@ -436,14 +436,125 @@ int zmk_hog_send_volume_knob_report_alt(struct zmk_hid_volume_knob_report_body_a
 
 #if IS_ENABLED(CONFIG_ZMK_HID_IO_PLOVER_HID)
 
-K_MSGQ_DEFINE(zmk_hog_plover_hid_alt_msgq, sizeof(struct zmk_hid_plover_hid_report_body_alt),
-              CONFIG_ZMK_HID_IO_BLE_PLOVER_HID_REPORT_QUEUE_SIZE, 4);
+/*
+ * Every Plover HID report is the full key state, and Plover builds a stroke as the union (OR) of
+ * all reports received between two all-released (zero) reports. A lost intermediate report thus
+ * loses a key, and a stale report delivered late becomes a phantom stroke. That is why this uses
+ * its own FIFO instead of a k_msgq: it has to be compacted in place and pushed back at the head.
+ *
+ * Invariant for the sequence the host receives, overflow included:
+ *  - the union of keys between two zero reports never shrinks, so no pressed key is lost;
+ *  - zero reports are never modified and the newest one is never dropped, so the final
+ *    "all released" report always arrives as is and the host ends with nothing held.
+ * On overflow the oldest pair of adjacent reports of the same kind is merged into the later one:
+ * two non-zero reports of one stroke are OR'ed (same union), two zero reports become one.
+ * Only if the FIFO holds strictly alternating strokes and releases (no lossless merge left) is
+ * the oldest release that has a report after it dropped. That glues two strokes into one, but
+ * still loses no key.
+ */
+#define PLOVER_HID_QUEUE_SIZE CONFIG_ZMK_HID_IO_BLE_PLOVER_HID_REPORT_QUEUE_SIZE
+
+/* One spare slot, so a report can be added first and the overflow compacted afterwards. */
+static struct zmk_hid_plover_hid_report_body_alt plover_hid_queue[PLOVER_HID_QUEUE_SIZE + 1];
+static size_t plover_hid_queue_len;
+static struct k_spinlock plover_hid_queue_lock;
+
+static bool plover_hid_report_is_empty(const struct zmk_hid_plover_hid_report_body_alt *report) {
+    for (size_t i = 0; i < sizeof(report->keys); i++) {
+        if (report->keys[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void plover_hid_queue_remove(size_t index) {
+    plover_hid_queue_len--;
+    memmove(&plover_hid_queue[index], &plover_hid_queue[index + 1],
+            (plover_hid_queue_len - index) * sizeof(plover_hid_queue[0]));
+}
+
+/* Called with the lock held and one report over capacity. Returns true if strokes were glued. */
+static bool plover_hid_queue_compact(void) {
+    for (size_t i = 0; i + 1 < plover_hid_queue_len; i++) {
+        struct zmk_hid_plover_hid_report_body_alt *cur = &plover_hid_queue[i];
+        struct zmk_hid_plover_hid_report_body_alt *next = &plover_hid_queue[i + 1];
+
+        if (plover_hid_report_is_empty(cur) == plover_hid_report_is_empty(next)) {
+            for (size_t k = 0; k < sizeof(next->keys); k++) {
+                next->keys[k] |= cur->keys[k];
+            }
+            plover_hid_queue_remove(i);
+            return false;
+        }
+    }
+
+    /* Strictly alternating, and with at least 3 reports a zero one is among the first two. */
+    for (size_t i = 0; i + 1 < plover_hid_queue_len; i++) {
+        if (plover_hid_report_is_empty(&plover_hid_queue[i])) {
+            plover_hid_queue_remove(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void plover_hid_queue_push(const struct zmk_hid_plover_hid_report_body_alt *report,
+                                  bool at_head) {
+    bool overflow = false, glued = false;
+    k_spinlock_key_t key = k_spin_lock(&plover_hid_queue_lock);
+
+    if (at_head) {
+        memmove(&plover_hid_queue[1], &plover_hid_queue[0],
+                plover_hid_queue_len * sizeof(plover_hid_queue[0]));
+        plover_hid_queue[0] = *report;
+    } else {
+        plover_hid_queue[plover_hid_queue_len] = *report;
+    }
+    plover_hid_queue_len++;
+
+    if (plover_hid_queue_len > PLOVER_HID_QUEUE_SIZE) {
+        overflow = true;
+        glued = plover_hid_queue_compact();
+    }
+
+    k_spin_unlock(&plover_hid_queue_lock, key);
+
+    if (glued) {
+        LOG_WRN("plover_hid queue full of whole strokes, glued the two oldest ones");
+    } else if (overflow) {
+        LOG_WRN("plover_hid queue full, merged two reports of the same stroke");
+    }
+}
+
+static bool plover_hid_queue_pop(struct zmk_hid_plover_hid_report_body_alt *report) {
+    k_spinlock_key_t key = k_spin_lock(&plover_hid_queue_lock);
+    bool found = plover_hid_queue_len > 0;
+
+    if (found) {
+        *report = plover_hid_queue[0];
+        plover_hid_queue_remove(0);
+    }
+
+    k_spin_unlock(&plover_hid_queue_lock, key);
+    return found;
+}
+
+/* Lost the host: drop pending reports and held keys, so nothing stale is sent after reconnect. */
+static void plover_hid_reset(void) {
+    k_spinlock_key_t key = k_spin_lock(&plover_hid_queue_lock);
+    plover_hid_queue_len = 0;
+    k_spin_unlock(&plover_hid_queue_lock, key);
+
+    zmk_hid_plover_hid_clear();
+}
 
 void send_plover_hid_report_alt_callback(struct k_work *work) {
     struct zmk_hid_plover_hid_report_body_alt report;
-    while (k_msgq_get(&zmk_hog_plover_hid_alt_msgq, &report, K_NO_WAIT) == 0) {
+    while (plover_hid_queue_pop(&report)) {
         struct bt_conn *conn = destination_connection_alt();
         if (conn == NULL) {
+            plover_hid_reset();
             return;
         }
 
@@ -455,7 +566,19 @@ void send_plover_hid_report_alt_callback(struct k_work *work) {
 
         int err = bt_gatt_notify_cb(conn, &notify_params);
         if (err == -EPERM) {
+            /*
+             * Keep the report at the head and stop. It is resent from security_changed once the
+             * link is encrypted (or by the next key event), never by looping here, so a link that
+             * stays unencrypted cannot spin this work item.
+             */
+            plover_hid_queue_push(&report, true);
             bt_conn_set_security(conn, BT_SECURITY_L2);
+            bt_conn_unref(conn);
+            return;
+        } else if (err == -ENOTCONN) {
+            bt_conn_unref(conn);
+            plover_hid_reset();
+            return;
         } else if (err) {
             LOG_DBG("Error notifying %d", err);
         }
@@ -467,24 +590,29 @@ void send_plover_hid_report_alt_callback(struct k_work *work) {
 K_WORK_DEFINE(hog_alt_plover_hid_work, send_plover_hid_report_alt_callback);
 
 int zmk_hog_send_plover_hid_report_alt(struct zmk_hid_plover_hid_report_body_alt *report) {
-    int err = k_msgq_put(&zmk_hog_plover_hid_alt_msgq, report, K_MSEC(100));
-    if (err) {
-        switch (err) {
-        case -EAGAIN: {
-            LOG_WRN("plover_hid message queue full, popping first message and queueing again");
-            struct zmk_hid_plover_hid_report_body_alt discarded_report;
-            k_msgq_get(&zmk_hog_plover_hid_alt_msgq, &discarded_report, K_NO_WAIT);
-            return zmk_hog_send_plover_hid_report_alt(report);
-        }
-        default:
-            LOG_WRN("Failed to queue plover_hid report to send (%d)", err);
-            return err;
-        }
-    }
+    plover_hid_queue_push(report, false);
 
     k_work_submit_to_queue(&hog_alt_work_q, &hog_alt_plover_hid_work);
 
     return 0;
+};
+
+static void plover_hid_disconnected(struct bt_conn *conn, uint8_t reason) {
+    if (!bt_addr_le_cmp(bt_conn_get_dst(conn), zmk_ble_active_profile_addr())) {
+        plover_hid_reset();
+    }
+}
+
+static void plover_hid_security_changed(struct bt_conn *conn, bt_security_t level,
+                                        enum bt_security_err err) {
+    if (err == BT_SECURITY_ERR_SUCCESS && level >= BT_SECURITY_L2) {
+        k_work_submit_to_queue(&hog_alt_work_q, &hog_alt_plover_hid_work);
+    }
+}
+
+BT_CONN_CB_DEFINE(plover_hid_conn_callbacks) = {
+    .disconnected = plover_hid_disconnected,
+    .security_changed = plover_hid_security_changed,
 };
 #endif // IS_ENABLED(CONFIG_ZMK_HID_IO_PLOVER_HID)
 

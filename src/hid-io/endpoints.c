@@ -138,8 +138,14 @@ int zmk_endpoints_send_volume_knob_report_alt() {
 #endif // IS_ENABLED(CONFIG_ZMK_HID_IO_VOLUME_KNOB)
 
 #if IS_ENABLED(CONFIG_ZMK_HID_IO_PLOVER_HID)
+/* ZMK v0.3 has zmk_endpoints_selected(), later ZMK renamed it to zmk_endpoint_get_selected(). */
+extern struct zmk_endpoint_instance zmk_endpoints_selected(void) __weak;
+extern struct zmk_endpoint_instance zmk_endpoint_get_selected(void) __weak;
+
 int zmk_endpoints_send_plover_hid_report_alt() {
-    struct zmk_endpoint_instance current_instance = zmk_endpoint_get_selected();
+    struct zmk_endpoint_instance current_instance = zmk_endpoint_get_selected
+                                                        ? zmk_endpoint_get_selected()
+                                                        : zmk_endpoints_selected();
 
     switch (current_instance.transport) {
 #if IS_ENABLED(CONFIG_ZMK_USB)
@@ -167,7 +173,8 @@ int zmk_endpoints_send_plover_hid_report_alt() {
     case ZMK_TRANSPORT_BLE: break;
 #endif /* IS_ENABLED(CONFIG_ZMK_BLE) */
 
-    case ZMK_TRANSPORT_NONE: return 0;
+    /* ZMK_TRANSPORT_NONE, which ZMK v0.3 does not define yet. */
+    default: return 0;
     }
 
     LOG_ERR("Unsupported endpoint transport %d", current_instance.transport);
