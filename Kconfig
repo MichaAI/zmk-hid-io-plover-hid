@@ -47,7 +47,11 @@ config ZMK_HID_IO_BLE_VOLUME_KNOB_REPORT_QUEUE_SIZE
 
 config ZMK_HID_IO_BLE_PLOVER_HID_REPORT_QUEUE_SIZE
     int "Max number of Plover HID reports to queue for sending over BLE"
-    default 4
+    range 2 64
+    default 16
+    help
+      When full, reports of the same stroke are OR'ed together instead of dropped,
+      so a deeper queue only delays that merging.
 
 DT_COMPAT_ZMK_INPUT_BEHAVIOR_FWD_TO_HID_IO := zmk,input-behavior-fwd-to-hid-io
 config ZMK_INPUT_BEHAVIOR_FWD_TO_HID_IO
